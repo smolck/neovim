@@ -256,8 +256,14 @@ Object dict_set_var(dict_T *dict, String key, Object value, bool del, bool retva
       tv_clear(&di->di_tv);
     }
 
+    // Notify watchers
+    if (tv_dict_is_watched(dict)) {
+      tv_dict_watcher_notify(dict, key.data, &tv, &di->di_tv);
+    }
+
     // Update the value
     tv_copy(&tv, &di->di_tv);
+
     // Clear the temporary variable
     tv_clear(&tv);
   }
