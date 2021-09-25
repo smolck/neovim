@@ -239,12 +239,12 @@ void early_init(mparm_T *paramp)
 }
 
 #ifdef MAKE_LIB
-int nvim_main(int argc, char **argv);  // silence -Wmissing-prototypes
-int nvim_main(int argc, char **argv)
+int nvim_main(int argc, char **argv, void (*f)(void));  // silence -Wmissing-prototypes
+int nvim_main(int argc, char **argv, void (*f)(void))
 #elif defined(MSWIN)
-int wmain(int argc, wchar_t **argv_w)  // multibyte args on Windows. #7060
+int wmain(int argc, wchar_t **argv_w, void (*f)(void))  // multibyte args on Windows. #7060
 #else
-int main(int argc, char **argv)
+int main(int argc, char **argv, void (*f)(void))
 #endif
 {
 #if defined(MSWIN) && !defined(MAKE_LIB)
@@ -352,6 +352,9 @@ int main(int argc, char **argv)
   // NORETURN: Start builtin UI client.
   if (ui_client_channel_id) {
     ui_client_run(remote_ui);  // NORETURN
+#ifdef MAKE_LIB
+    f();
+#endif
   }
   assert(!ui_client_channel_id && !use_builtin_ui);
   // Nvim server...
