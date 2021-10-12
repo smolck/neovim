@@ -244,6 +244,11 @@ Object dict_set_var(dict_T *dict, String key, Object value, bool del, bool retva
       return rv;
     }
 
+    // Notify watchers
+    if (tv_dict_is_watched(dict)) {
+      tv_dict_watcher_notify(dict, key.data, &tv, &di->di_tv);
+    }
+
     if (di == NULL) {
       // Need to create an entry
       di = tv_dict_item_alloc_len(key.data, key.size);
@@ -254,11 +259,6 @@ Object dict_set_var(dict_T *dict, String key, Object value, bool del, bool retva
         rv = vim_to_object(&di->di_tv);
       }
       tv_clear(&di->di_tv);
-    }
-
-    // Notify watchers
-    if (tv_dict_is_watched(dict)) {
-      tv_dict_watcher_notify(dict, key.data, &tv, &di->di_tv);
     }
 
     // Update the value
