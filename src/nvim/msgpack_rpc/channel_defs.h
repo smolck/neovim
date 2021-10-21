@@ -1,9 +1,11 @@
 #ifndef NVIM_MSGPACK_RPC_CHANNEL_DEFS_H
 #define NVIM_MSGPACK_RPC_CHANNEL_DEFS_H
 
-#include <msgpack.h>
+// #include <msgpack.h>
 #include <stdbool.h>
 #include <uv.h>
+
+#include "mpack/object.h"
 
 #include "nvim/api/private/defs.h"
 #include "nvim/event/process.h"
@@ -29,7 +31,7 @@ typedef struct {
 typedef struct {
   PMap(cstr_t) subscribed_events[1];
   bool closed;
-  msgpack_unpacker *unpacker;
+  mpack_parser_t *parser;
   uint32_t next_request_id;
   kvec_t(ChannelCallFrame *) call_stack;
   Dictionary info;

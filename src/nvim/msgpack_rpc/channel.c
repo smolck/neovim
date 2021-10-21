@@ -7,6 +7,7 @@
 #include <string.h>
 #include <uv.h>
 
+#include "nvim/api/private/defs.h"
 #include "nvim/api/private/helpers.h"
 #include "nvim/api/ui.h"
 #include "nvim/api/vim.h"
@@ -50,6 +51,14 @@ void rpc_init(void)
   msgpack_sbuffer_init(&out_buffer);
 }
 
+typedef struct {
+  Object deserialized;
+  char *string_buffer;
+  Object *container;
+
+  // bool unpacking;
+  // int reg, ext, unpacking, mtdict;
+} Unpacker;
 
 void rpc_start(Channel *channel)
 {
@@ -57,7 +66,18 @@ void rpc_start(Channel *channel)
   channel->is_rpc = true;
   RpcState *rpc = &channel->rpc;
   rpc->closed = false;
-  rpc->unpacker = msgpack_unpacker_new(MSGPACK_UNPACKER_INIT_BUFFER_SIZE);
+
+  // TODO(smolck): Don't want to use MSGPACK_UNPACKER_INIT_BUFFER_SIZE, since it's defined in msgpack-c
+  mpack_parser_t *parser = xmalloc(MPACK_PARSER_STRUCT_SIZE(MSGPACK_UNPACKER_INIT_BUFFER_SIZE));
+  mpack_parser_init(parser, 0);
+
+  Unpacker *rv = xmalloc(sizeof(Unpacker));
+  rv->deserialized = (Object)OBJECT_INIT;
+  rv->container = NULL;
+  parser->data.p = rv;
+
+  rpc->parser = parser;
+
   rpc->next_request_id = 1;
   rpc->info = (Dictionary)ARRAY_DICT_INIT;
   kv_init(rpc->call_stack);
@@ -202,6 +222,109 @@ void rpc_unsubscribe(uint64_t id, char *event)
   unsubscribe(channel, event);
 }
 
+static void parse_enter(mpack_parser_t *parser, mpack_node_t *node)
+{
+  Unpacker *unpacker = parser->data.p;
+
+  mpack_node_t *parent = MPACK_PARENT_NODE(node);
+  mpack_token_t *t = &node->tok;
+
+  Object *p = NULL;
+  if (parent && parent->data[0].p) {
+    p = parent->data[0].p;
+  }
+
+  Object obj = OBJECT_INIT;
+
+  switch (t->type) {
+    case MPACK_TOKEN_BOOLEAN:
+      obj = BOOLEAN_OBJ(mpack_unpack_boolean(*t));
+      break;
+    case MPACK_TOKEN_FLOAT:
+      // TODO(smolck): mpack_unpack_float_fast good or do we want *_compat?
+      obj = FLOAT_OBJ(mpack_unpack_float_fast(*t));
+      break;
+    case MPACK_TOKEN_NIL:
+      break;
+    case MPACK_TOKEN_CHUNK:
+      assert(unpacker->string_buffer);
+      memcpy(unpacker->string_buffer + parent->pos,
+          node->tok.data.chunk_ptr, node->tok.length);
+
+      // We don't do anything with `obj` in this case, so return from function.
+      goto parse_end;
+    case MPACK_TOKEN_BIN:
+    case MPACK_TOKEN_STR:
+    case MPACK_TOKEN_EXT:
+      unpacker->string_buffer = xmalloc(node->tok.length);
+
+      // We don't do anything with `obj` in this case, so return from function.
+      goto parse_end;
+
+      // if (!unpacker->string_buffer) luaL_error(L, "Failed to allocate memory");
+    case MPACK_TOKEN_ARRAY:
+      obj = ARRAY_OBJ(ARRAY_DICT_INIT);
+      printf("array obj\n");
+      break;
+    case MPACK_TOKEN_SINT:
+      obj = INTEGER_OBJ(mpack_unpack_sint(*t));
+      break;
+    case MPACK_TOKEN_UINT:
+      obj = INTEGER_OBJ(mpack_unpack_uint(*t));
+      break;
+  }
+
+  if (p) {
+    if (p->type == kObjectTypeArray /* TODO(smolck): || obj.type == kObjectTypeDictionary */) {
+      ADD(p->data.array, obj);
+
+      if (obj.type == kObjectTypeArray /* TODO(smolck): || obj.type == kObjectTypeDictionary */) {
+        node->data[0].p = &kv_last(p->data.array);
+      }
+    }
+  } else {
+    unpacker->deserialized = obj;
+
+    if (obj.type == kObjectTypeArray /* TODO(smolck): || obj.type == kObjectTypeDictionary */) {
+      node->data[0].p = &unpacker->deserialized;
+    }
+  }
+
+parse_end:
+  return;
+}
+
+static void parse_exit(mpack_parser_t *parser, mpack_node_t *node)
+{
+  Unpacker *unpacker = parser->data.p;
+
+  mpack_node_t *parent = MPACK_PARENT_NODE(node);
+  mpack_token_t *t = &node->tok;
+
+  switch (t->type) {
+    case MPACK_TOKEN_STR:
+      (void)(5);
+
+      char* dest = xmalloc(node->tok.length * sizeof(char *));
+      memcpy(dest, unpacker->string_buffer, node->tok.length);
+
+      Object *p = parent->data[0].p;
+      if (p) {
+        ADD(p->data.array, ((Object) { .type = kObjectTypeString, .data.string = {
+          .data = dest,
+          .size = node->tok.length
+        }}));
+      } else {
+        unpacker->deserialized = (Object){ .type = kObjectTypeString, .data.string = {
+          .data = dest,
+          .size = node->tok.length
+        }};
+      }
+      xfree(unpacker->string_buffer);
+      break;
+  }
+}
+
 static void receive_msgpack(Stream *stream, RBuffer *rbuf, size_t c, void *data, bool eof)
 {
   Channel *channel = data;
@@ -221,65 +344,91 @@ static void receive_msgpack(Stream *stream, RBuffer *rbuf, size_t c, void *data,
        channel->id, count, (void *)stream);
 
   // Feed the unpacker with data
-  msgpack_unpacker_reserve_buffer(channel->rpc.unpacker, count);
-  rbuffer_read(rbuf, msgpack_unpacker_buffer(channel->rpc.unpacker), count);
-  msgpack_unpacker_buffer_consumed(channel->rpc.unpacker, count);
+  if (!(channel->rpc.parser->capacity > count)) {
+    grow_mpack_parser(channel->rpc.parser);
+  }
 
-  parse_msgpack(channel);
+  size_t r;
+  char *ptr = rbuffer_read_ptr(rbuf, &r);
+
+  mpack_parse(channel->rpc.parser, (const char**)&ptr, &count, parse_enter, parse_exit);
+
+  Unpacker *unpacker = channel->rpc.parser->data.p;
+
+  bool is_response = is_rpc_response(&unpacker->deserialized);
+  log_client_msg(channel->id, !is_response, unpacker->deserialized);
+
+  if (is_response) {
+   if (is_valid_rpc_response(&unpacker->deserialized, channel)) {
+     // complete_call(&unpacked.data, channel);
+   } else {
+     char buf[256];
+     snprintf(buf, sizeof(buf),
+              "ch %" PRIu64 " returned a response with an unknown request "
+              "id. Ensure the client is properly synchronized",
+              channel->id);
+     call_set_error(channel, buf, ERROR_LOG_LEVEL);
+   }
+   // msgpack_unpacked_destroy(&unpacked);
+  } else {
+   // handle_request(channel, &unpacked.data);
+  }
+
+  api_free_object(unpacker->deserialized);
 
 end:
   channel_decref(channel);
 }
 
-static void parse_msgpack(Channel *channel)
-{
-  msgpack_unpacked unpacked;
-  msgpack_unpacked_init(&unpacked);
-  msgpack_unpack_return result;
-
-  // Deserialize everything we can.
-  while ((result = msgpack_unpacker_next(channel->rpc.unpacker, &unpacked)) ==
-         MSGPACK_UNPACK_SUCCESS) {
-    bool is_response = is_rpc_response(&unpacked.data);
-    log_client_msg(channel->id, !is_response, unpacked.data);
-
-    if (is_response) {
-      if (is_valid_rpc_response(&unpacked.data, channel)) {
-        complete_call(&unpacked.data, channel);
-      } else {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "ch %" PRIu64 " returned a response with an unknown request "
-                 "id. Ensure the client is properly synchronized",
-                 channel->id);
-        call_set_error(channel, buf, ERROR_LOG_LEVEL);
-      }
-      msgpack_unpacked_destroy(&unpacked);
-    } else {
-      handle_request(channel, &unpacked.data);
-    }
-  }
-
-  if (result == MSGPACK_UNPACK_NOMEM_ERROR) {
-    mch_errmsg(e_outofmem);
-    mch_errmsg("\n");
-    channel_decref(channel);
-    preserve_exit();
-  }
-
-  if (result == MSGPACK_UNPACK_PARSE_ERROR) {
-    // See src/msgpack/unpack_template.h in msgpack source tree for
-    // causes for this error(search for 'goto _failed')
-    //
-    // A not so uncommon cause for this might be deserializing objects with
-    // a high nesting level: msgpack will break when its internal parse stack
-    // size exceeds MSGPACK_EMBED_STACK_SIZE (defined as 32 by default)
-    send_error(channel, kMessageTypeRequest, 0,
-               "Invalid msgpack payload. "
-               "This error can also happen when deserializing "
-               "an object with high level of nesting");
-  }
-}
+// static void parse_msgpack(Channel *channel)
+// {
+//   msgpack_unpacked unpacked;
+//   msgpack_unpacked_init(&unpacked);
+//   msgpack_unpack_return result;
+// 
+//   // Deserialize everything we can.
+//   while ((result = msgpack_unpacker_next(channel->rpc.unpacker, &unpacked)) ==
+//          MSGPACK_UNPACK_SUCCESS) {
+//     bool is_response = is_rpc_response(&unpacked.data);
+//     log_client_msg(channel->id, !is_response, unpacked.data);
+// 
+//     if (is_response) {
+//       if (is_valid_rpc_response(&unpacked.data, channel)) {
+//         complete_call(&unpacked.data, channel);
+//       } else {
+//         char buf[256];
+//         snprintf(buf, sizeof(buf),
+//                  "ch %" PRIu64 " returned a response with an unknown request "
+//                  "id. Ensure the client is properly synchronized",
+//                  channel->id);
+//         call_set_error(channel, buf, ERROR_LOG_LEVEL);
+//       }
+//       msgpack_unpacked_destroy(&unpacked);
+//     } else {
+//       handle_request(channel, &unpacked.data);
+//     }
+//   }
+// 
+//   if (result == MSGPACK_UNPACK_NOMEM_ERROR) {
+//     mch_errmsg(e_outofmem);
+//     mch_errmsg("\n");
+//     channel_decref(channel);
+//     preserve_exit();
+//   }
+// 
+//   if (result == MSGPACK_UNPACK_PARSE_ERROR) {
+//     // See src/msgpack/unpack_template.h in msgpack source tree for
+//     // causes for this error(search for 'goto _failed')
+//     //
+//     // A not so uncommon cause for this might be deserializing objects with
+//     // a high nesting level: msgpack will break when its internal parse stack
+//     // size exceeds MSGPACK_EMBED_STACK_SIZE (defined as 32 by default)
+//     send_error(channel, kMessageTypeRequest, 0,
+//                "Invalid msgpack payload. "
+//                "This error can also happen when deserializing "
+//                "an object with high level of nesting");
+//   }
+// }
 
 /// Handles requests and notifications received on the channel.
 static void handle_request(Channel *channel, msgpack_object *request)
@@ -434,12 +583,12 @@ static void internal_read_event(void **argv)
   Channel *channel = argv[0];
   WBuffer *buffer = argv[1];
 
-  msgpack_unpacker_reserve_buffer(channel->rpc.unpacker, buffer->size);
+  /*msgpack_unpacker_reserve_buffer(channel->rpc.unpacker, buffer->size);
   memcpy(msgpack_unpacker_buffer(channel->rpc.unpacker),
          buffer->data, buffer->size);
   msgpack_unpacker_buffer_consumed(channel->rpc.unpacker, buffer->size);
 
-  parse_msgpack(channel);
+  parse_msgpack(channel);*/
 
   channel_decref(channel);
   wstream_release_wbuffer(buffer);
@@ -563,7 +712,10 @@ static void exit_event(void **argv)
 void rpc_free(Channel *channel)
 {
   remote_ui_disconnect(channel->id);
-  msgpack_unpacker_free(channel->rpc.unpacker);
+  xfree(channel->rpc.parser->data.p);
+  xfree(channel->rpc.parser);
+  // TODO(smolck): ? 
+  // kvec_destroy(channel->rpc.parser.data.p);
 
   // Unsubscribe from all events
   char *event_string;
@@ -576,18 +728,22 @@ void rpc_free(Channel *channel)
   api_free_dictionary(channel->rpc.info);
 }
 
-static bool is_rpc_response(msgpack_object *obj)
+static bool is_rpc_response(Object *obj)
 {
-  return obj->type == MSGPACK_OBJECT_ARRAY
-         && obj->via.array.size == 4
-         && obj->via.array.ptr[0].type == MSGPACK_OBJECT_POSITIVE_INTEGER
-         && obj->via.array.ptr[0].via.u64 == 1
-         && obj->via.array.ptr[1].type == MSGPACK_OBJECT_POSITIVE_INTEGER;
+  return obj->type == kObjectTypeArray
+         && obj->data.array.size == 4
+         && obj->data.array.items[0].type == kObjectTypeInteger
+         && obj->data.array.items[0].data.integer == 1
+         && obj->data.array.items[1].type == kObjectTypeInteger;
 }
 
-static bool is_valid_rpc_response(msgpack_object *obj, Channel *channel)
+static bool is_valid_rpc_response(Object *obj, Channel *channel)
 {
-  uint32_t response_id = (uint32_t)obj->via.array.ptr[1].via.u64;
+  if (obj->type != kObjectTypeArray) {
+    return false;
+  }
+
+  uint32_t response_id = (uint32_t)obj->data.array.items[1].data.integer;
   if (kv_size(channel->rpc.call_stack) == 0) {
     return false;
   }
@@ -717,7 +873,7 @@ static const char *const msgpack_error_messages[] = {
 
 static void log_server_msg(uint64_t channel_id, msgpack_sbuffer *packed)
 {
-  msgpack_unpacked unpacked;
+  /*msgpack_unpacked unpacked;
   msgpack_unpacked_init(&unpacked);
   DLOGN("RPC ->ch %" PRIu64 ": ", channel_id);
   const msgpack_unpack_return result =
@@ -748,10 +904,10 @@ static void log_server_msg(uint64_t channel_id, msgpack_sbuffer *packed)
       });
     break;
   }
-  }
+  }*/
 }
 
-static void log_client_msg(uint64_t channel_id, bool is_request, msgpack_object msg)
+static void log_client_msg(uint64_t channel_id, bool is_request, Object msg)
 {
   DLOGN("RPC <-ch %" PRIu64 ": ", channel_id);
   log_lock();
@@ -760,9 +916,10 @@ static void log_client_msg(uint64_t channel_id, bool is_request, msgpack_object 
   log_msg_close(f, msg);
 }
 
-static void log_msg_close(FILE *f, msgpack_object msg)
+static void log_msg_close(FILE *f, Object msg)
 {
-  msgpack_object_print(f, msg);
+  // TODO(smolck):
+  // msgpack_object_print(f, msg);
   fputc('\n', f);
   fflush(f);
   fclose(f);

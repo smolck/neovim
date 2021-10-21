@@ -8,6 +8,8 @@
 #include "nvim/api/private/defs.h"
 #include "nvim/event/wstream.h"
 
+#include "mpack/object.h"
+
 /// Value by which objects represented as EXT type are shifted
 ///
 /// Subtracted when packing, added when unpacking. Used to allow moving

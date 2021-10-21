@@ -22,6 +22,21 @@
 static msgpack_zone zone;
 static msgpack_sbuffer sbuffer;
 
+// TODO(smolck): Pass in new capacity/how much we want to increase
+// the capacity by? Or is this fine?
+// from lmpack_grow_parser in mpack/lmpack.c
+mpack_parser_t *grow_mpack_parser(mpack_parser_t *parser)
+{
+  mpack_parser_t *old = parser;
+  mpack_uint32_t new_capacity = old->capacity * 2;
+  parser = malloc(MPACK_PARSER_STRUCT_SIZE(new_capacity));
+  if (!parser) goto end;
+  mpack_parser_init(parser, new_capacity);
+  mpack_parser_copy(parser, old);
+  free(old);
+end:
+  return parser;
+}
 
 void msgpack_rpc_helpers_init(void)
 {
