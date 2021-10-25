@@ -54,7 +54,6 @@ void rpc_init(void)
 typedef struct {
   Object deserialized;
   char *string_buffer;
-  Object *container;
 
   // bool unpacking;
   // int reg, ext, unpacking, mtdict;
@@ -73,7 +72,6 @@ void rpc_start(Channel *channel)
 
   Unpacker *rv = xmalloc(sizeof(Unpacker));
   rv->deserialized = (Object)OBJECT_INIT;
-  rv->container = NULL;
   parser->data.p = rv;
 
   rpc->parser = parser;
